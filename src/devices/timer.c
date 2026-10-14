@@ -23,9 +23,13 @@ static int64_t ticks;
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
+static struct list sleep_list;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
+static bool wake_tick_less (const struct list_elem *a,
+                            const struct list_elem *b, void *aux UNUSED);
+static void wake_sleepers (void);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
@@ -35,6 +39,7 @@ static void real_time_delay (int64_t num, int32_t denom);
 void
 timer_init (void) 
 {
+  list_init (&sleep_list);
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
 }
@@ -87,13 +92,22 @@ timer_elapsed (int64_t then)
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
 void
-timer_sleep (int64_t ticks) 
+timer_sleep (int64_t sleep_ticks) 
 {
-  int64_t start = timer_ticks ();
+  struct thread *current;
+  enum intr_level old_level;
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  if (sleep_ticks <= 0)
+    return;
+
+  old_level = intr_disable ();
+  current = thread_current ();
+  current->wake_tick = ticks + sleep_ticks;
+  list_insert_ordered (&sleep_list, &current->elem, wake_tick_less, NULL);
+  thread_block ();
+  intr_set_level (old_level);
+
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -171,7 +185,36 @@ static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
+  wake_sleepers ();
   thread_tick ();
+}
+
+/* Returns true if A's thread has an earlier wake tick than B's. */
+static bool
+wake_tick_less (const struct list_elem *a, const struct list_elem *b,
+                void *aux UNUSED)
+{
+  const struct thread *thread_a = list_entry (a, struct thread, elem);
+  const struct thread *thread_b = list_entry (b, struct thread, elem);
+
+  return thread_a->wake_tick < thread_b->wake_tick;
+}
+
+/* Unblocks all threads whose requested sleep has expired. */
+static void
+wake_sleepers (void)
+{
+  while (!list_empty (&sleep_list))
+    {
+      struct thread *thread = list_entry (list_front (&sleep_list),
+                                          struct thread, elem);
+
+      if (thread->wake_tick > ticks)
+        break;
+
+      list_pop_front (&sleep_list);
+      thread_unblock (thread);
+    }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
